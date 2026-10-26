@@ -119,14 +119,44 @@ def headline_from_text(text, max_chars=82):
     return cut.rstrip(" ,।-") + "…"
 
 def find_font():
-    candidates = []
-    candidates += glob.glob("/usr/share/fonts/**/*Devanagari*.ttf", recursive=True)
-    candidates += glob.glob("/usr/share/fonts/**/*devanagari*.ttf", recursive=True)
-    candidates += glob.glob("/usr/share/fonts/truetype/noto/*.ttf", recursive=True)
-    for p in candidates:
-        if "Devanagari" in os.path.basename(p) or "devanagari" in p.lower():
-            return p
-    return candidates[0] if candidates else None
+    """Find a font that supports Hindi / Devanagari."""
+    import os
+    import glob
+    import subprocess
+
+    # First try the installed Noto Devanagari font.
+    try:
+        result = subprocess.run(
+            ["fc-match", "-f", "%{file}", "Noto Sans Devanagari"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        font_path = result.stdout.strip().splitlines()[0]
+        if font_path and os.path.isfile(font_path):
+            ImageFont.truetype(font_path, 40)
+            return font_path
+    except Exception:
+        pass
+
+    # Search common font folders.
+    patterns = [
+        "/usr/share/fonts/**/*Devanagari*.ttf",
+        "/usr/share/fonts/**/*devanagari*.ttf",
+        "/usr/share/fonts/**/*Devanagari*.otf",
+        "/usr/share/fonts/**/*devanagari*.otf",
+    ]
+
+    for pattern in patterns:
+        for font_path in glob.glob(pattern, recursive=True):
+            try:
+                ImageFont.truetype(font_path, 40)
+                return font_path
+            except Exception:
+                continue
+
+    # No suitable font found.
+    return None
 
 def wrap_text(draw, text, font, max_width):
     words = (text or "").split()
