@@ -49,7 +49,13 @@ def get_audio_duration(path):
 def transcribe_audio(path, model_size="base"):
     from faster_whisper import WhisperModel
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segments, info = model.transcribe(path, beam_size=3, vad_filter=True)
+    segments, info = model.transcribe(
+    path,
+    language="hi",
+    task="transcribe",
+    beam_size=5,
+    vad_filter=True
+)
     rows = []
     for seg in segments:
         txt = (seg.text or "").strip()
