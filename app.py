@@ -3,7 +3,6 @@ import os
 import re
 import glob
 import html
-import time
 import shutil
 import subprocess
 import tempfile
@@ -13,286 +12,263 @@ from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, features
 
 APP_TITLE = "Hindi News Video Generator"
-W, H = 1920, 1080
-FPS = 25
-MAX_IMAGE_MB = 15
-MAX_VIDEO_MB = 100
-USER_AGENT = (
+W, H, FPS = 1920, 1080, 25
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_VIDEO_BYTES = 100 * 1024 * 1024
+UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
 )
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
 st.title("Hindi News Video Generator")
-st.caption(
-    "Upload Hindi narration, find relevant news images, "
-    "add Hindi headlines, and export a 1080p MP4."
+st.write(
+    "Upload narration → transcribe in Hindi → find related images → "
+    "create a 1080p MP4."
 )
 
-st.info(
-    "No API key is required. The app searches Google News RSS and attempts "
-    "to retrieve images from related news articles. If an image cannot be "
-    "retrieved, it creates a labelled fallback graphic and provides a "
-    "Google Images search link. Image reuse permissions are not guaranteed."
-)
+session = requests.Session()
+session.headers.update({"User-Agent": UA})
 
 
-def run_cmd(cmd, timeout=600):
+# -------------------- SYSTEM AND FONT --------------------
+
+def run_cmd(args, timeout=600):
     result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=timeout
     )
-    if result.returncode != 0:
+    if result.returncode:
         raise RuntimeError(
-            (result.stderr or result.stdout or "Command failed")[-4000:]
+            (result.stderr or result.stdout or "Command failed")[-3500:]
         )
     return result.stdout.strip()
 
 
-def check_ffmpeg():
-    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+def ffmpeg_ready():
+    return shutil.which("ffmpeg") and shutil.which("ffprobe")
 
 
-def audio_duration(path):
+def audio_length(path):
     value = run_cmd([
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path,
+        "-of", "default=noprint_wrappers=1:nokey=1", path
     ], timeout=60)
     return max(1.0, float(value))
+
+
+def find_hindi_font():
+    # Known paths on Debian/Streamlit Cloud with fonts-noto-core installed.
+    preferred = [
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSerifDevanagari-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Regular.ttf",
+    ]
+
+    candidates = preferred[:]
+    for pattern in (
+        "/usr/share/fonts/**/*Devanagari*.ttf",
+        "/usr/share/fonts/**/*devanagari*.ttf",
+        "/usr/share/fonts/**/*Devanagari*.otf",
+        "/usr/share/fonts/**/*devanagari*.otf",
+    ):
+        candidates.extend(glob.glob(pattern, recursive=True))
+
+    seen = set()
+    for path in candidates:
+        if path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+        try:
+            font = ImageFont.truetype(path, 44)
+            # Confirm the font contains some essential Devanagari glyphs.
+            mask = font.getmask("हिंदी समाचार")
+            if mask.getbbox():
+                return path
+        except Exception:
+            continue
+
+    # fc-match can return a Latin font even when asked for Devanagari.
+    try:
+        result = subprocess.run(
+            ["fc-match", "-f", "%{file}", "Noto Sans Devanagari"],
+            capture_output=True, text=True, timeout=10
+        )
+        path = result.stdout.strip().splitlines()[0]
+        if "devanagari" in os.path.basename(path).lower():
+            return path
+    except Exception:
+        pass
+
+    return None
+
+
+FONT_PATH = None
+
+
+def get_font(size, bold=False):
+    if not FONT_PATH:
+        raise RuntimeError(
+            "Hindi font is missing. Install fonts-noto-core and "
+            "fonts-noto-extra in packages.txt, then reboot Streamlit."
+        )
+
+    path = FONT_PATH
+    if bold:
+        bold_path = path.replace("Regular", "Bold")
+        if os.path.isfile(bold_path):
+            path = bold_path
+
+    # RAQM enables complex-script shaping when Pillow was built with it.
+    try:
+        if features.check_feature("raqm"):
+            return ImageFont.truetype(
+                path, size, layout_engine=ImageFont.Layout.RAQM
+            )
+    except Exception:
+        pass
+
+    return ImageFont.truetype(path, size)
 
 
 def transcribe_audio(path, model_size):
     from faster_whisper import WhisperModel
 
     model = WhisperModel(
-        model_size,
-        device="cpu",
-        compute_type="int8",
+        model_size, device="cpu", compute_type="int8"
     )
-
     segments, info = model.transcribe(
         path,
         language="hi",
         task="transcribe",
         beam_size=5,
         vad_filter=True,
+        condition_on_previous_text=True,
     )
 
     rows = []
-    for seg in segments:
-        text = (seg.text or "").strip()
+    for segment in segments:
+        text = (segment.text or "").strip()
         if text:
             rows.append({
-                "start": float(seg.start),
-                "end": float(seg.end),
+                "start": float(segment.start),
+                "end": float(segment.end),
                 "text": text,
             })
 
     return rows, getattr(info, "language", "hi")
 
 
-def find_font():
-    """Find a font intended for Devanagari; never silently select Latin-only."""
+# -------------------- TRANSCRIPT AND SCENE PLAN --------------------
 
-    patterns = [
-        "/usr/share/fonts/**/*Devanagari*.ttf",
-        "/usr/share/fonts/**/*devanagari*.ttf",
-        "/usr/share/fonts/**/*Devanagari*.otf",
-        "/usr/share/fonts/**/*devanagari*.otf",
+def split_sentences(text):
+    return [
+        s.strip() for s in re.split(r"(?<=[।!?])\s+|\n+", text)
+        if s.strip()
     ]
 
-    for pattern in patterns:
-        for path in glob.glob(pattern, recursive=True):
-            try:
-                ImageFont.truetype(path, 40)
-                return path
-            except Exception:
-                continue
 
-    # Check a known Noto font location if available.
-    known = [
-        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+def suggest_query(text):
+    rules = [
+        (r"मोदी|प्रधानमंत्री|पीएम", "Narendra Modi India latest news"),
+        (r"अमित शाह|गृह मंत्री", "Amit Shah India latest news"),
+        (r"राहुल गांधी|कांग्रेस", "Rahul Gandhi Congress India latest news"),
+        (r"भाजपा|बीजेपी|BJP", "BJP India political news"),
+        (r"सुप्रीम कोर्ट|अदालत|कोर्ट|जज", "Supreme Court of India news"),
+        (r"चुनाव|वोटर|मतदान|चुनाव आयोग", "India election voting news"),
+        (r"संसद|लोकसभा|राज्यसभा", "Indian parliament news"),
+        (r"पुलिस|गिरफ्तार|लाठीचार्ज", "India police arrest protest news"),
+        (r"प्रदर्शन|धरना|आंदोलन|रैली", "India protest rally news"),
+        (r"बंगाल|ममता", "West Bengal Mamata Banerjee news"),
+        (r"युद्ध|सेना|मिसाइल|सीमा", "military international conflict news"),
+        (r"ट्रंप|अमेरिका|अमेरिकी", "Donald Trump United States news"),
+        (r"चीन|चीनी", "China government latest news"),
+        (r"किसान", "Indian farmers protest news"),
+        (r"मौसम|बारिश|बाढ़", "India weather flood rain news"),
+        (r"एआई|कृत्रिम बुद्धिमत्ता|तकनीक", "AI technology news"),
     ]
-    for path in known:
-        if os.path.isfile(path):
-            try:
-                ImageFont.truetype(path, 40)
-                return path
-            except Exception:
-                pass
+    for pattern, query in rules:
+        if re.search(pattern, text or "", re.I):
+            return query
 
-    return None
-
-
-def get_font(font_path, size):
-    if not font_path:
-        raise RuntimeError(
-            "Hindi font not found. Add fonts-noto-core to packages.txt "
-            "and reboot the Streamlit app."
-        )
-    return ImageFont.truetype(font_path, size)
+    words = re.findall(r"[A-Za-z][A-Za-z -]{2,}", text or "")
+    words = [
+        x.strip() for x in words
+        if x.strip().lower() not in {
+            "the", "and", "for", "with", "from", "this", "that", "news"
+        }
+    ]
+    return " ".join(words[:5]) + " India news" if words else "India latest news"
 
 
-def wrap_text(draw, text, font, max_width, max_lines=3):
-    words = (text or "").split()
-    lines = []
-    line = ""
-
-    for word in words:
-        candidate = word if not line else line + " " + word
-        width = draw.textbbox((0, 0), candidate, font=font)[2]
-
-        if width <= max_width:
-            line = candidate
-        else:
-            if line:
-                lines.append(line)
-            line = word
-
-    if line:
-        lines.append(line)
-
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        lines[-1] = lines[-1].rstrip("।, ") + "…"
-
-    return lines
+def make_headline(text, limit=82):
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(text) <= limit:
+        return text or "ताज़ा खबर"
+    cut = text[:limit]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,।-") + "…"
 
 
-def make_overlay(headline, output_path, font_path):
-    image = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
+def make_scene_plan(transcript, duration, max_scenes, seconds_per_scene):
+    sentences = split_sentences(transcript)
+    if not sentences:
+        sentences = [transcript.strip()]
 
-    label_font = get_font(font_path, 42)
-    headline_font = get_font(font_path, 68)
-    small_font = get_font(font_path, 28)
+    target = max(1, min(max_scenes, int(duration / seconds_per_scene) + 1))
+    target = min(target, len(sentences))
+    chunk_size = max(1, (len(sentences) + target - 1) // target)
 
-    draw.rounded_rectangle(
-        (65, 55, 510, 145),
-        radius=18,
-        fill=(190, 0, 0, 240),
-    )
-    draw.text(
-        (90, 72),
-        "ताज़ा खबर",
-        font=label_font,
-        fill="white",
-        stroke_width=1,
-        stroke_fill="black",
+    chunks = [
+        " ".join(sentences[i:i + chunk_size])
+        for i in range(0, len(sentences), chunk_size)
+    ]
+
+    return "\n".join(
+        f"{suggest_query(chunk)} | {make_headline(chunk)}"
+        for chunk in chunks
     )
 
-    draw.rectangle((0, 790, W, H), fill=(0, 0, 0, 215))
-    draw.rectangle((0, 790, W, 808), fill=(255, 190, 0, 255))
 
-    lines = wrap_text(draw, headline, headline_font, W - 140, 3)
-    y = 820 if len(lines) <= 2 else 810
+# -------------------- GOOGLE NEWS AND IMAGE DISCOVERY --------------------
 
-    for line in lines:
-        draw.text(
-            (70, y),
-            line,
-            font=headline_font,
-            fill="white",
-            stroke_width=2,
-            stroke_fill="black",
-        )
-        y += 78
-
-    draw.text(
-        (70, 1030),
-        "समाचार और विश्लेषण",
-        font=small_font,
-        fill=(255, 215, 80, 255),
-    )
-
-    image.save(output_path)
-
-
-def make_fallback_card(output_path, font_path):
-    """Create a background only; headline is drawn by the overlay once."""
-
-    image = Image.new("RGB", (W, H), (25, 38, 60))
-    draw = ImageDraw.Draw(image)
-    small_font = get_font(font_path, 44)
-
-    draw.rectangle((0, 0, W, 28), fill=(210, 0, 0))
-    draw.text(
-        (90, 100),
-        "NEWS EXPLAINER",
-        font=small_font,
-        fill=(255, 200, 0),
-    )
-    draw.text(
-        (90, 180),
-        "Illustrative graphic — not actual event footage",
-        font=get_font(font_path, 30),
-        fill=(225, 230, 240),
-    )
-    image.save(output_path)
-
-
-def search_news_links(query, limit=5):
-    """Discover recent articles using Google News RSS."""
-
-    url = (
+def search_news(query, limit=6):
+    rss_url = (
         "https://news.google.com/rss/search?q="
         + quote_plus(query)
         + "&hl=hi&gl=IN&ceid=IN:hi"
     )
-
-    response = requests.get(
-        url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=20,
-    )
+    response = session.get(rss_url, timeout=20)
     response.raise_for_status()
-
     root = ET.fromstring(response.content)
-    articles = []
 
+    articles = []
     for item in root.findall(".//item")[:limit]:
         title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        pub_date = (item.findtext("pubDate") or "").strip()
-
-        if title and link:
+        url = (item.findtext("link") or "").strip()
+        date = (item.findtext("pubDate") or "").strip()
+        if title and url:
             articles.append({
-                "title": title,
-                "url": link,
-                "published": pub_date,
+                "title": title, "url": url, "published": date
             })
-
     return articles
 
 
-def extract_image_from_article(article):
-    """
-    Try to obtain the main image from an article's Open Graph metadata.
-    Some publishers block requests or do not expose their images.
-    """
-
+def extract_meta_image(article_url):
     try:
-        response = requests.get(
-            article["url"],
-            headers={"User-Agent": USER_AGENT},
-            timeout=18,
-            allow_redirects=True,
+        response = session.get(
+            article_url, timeout=15, allow_redirects=True
         )
-
         if response.status_code != 200:
             return None
 
         page = response.text[:2_000_000]
-
         patterns = [
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
             r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
@@ -302,7 +278,7 @@ def extract_image_from_article(article):
 
         image_url = None
         for pattern in patterns:
-            match = re.search(pattern, page, re.IGNORECASE)
+            match = re.search(pattern, page, re.I)
             if match:
                 image_url = html.unescape(match.group(1).strip())
                 break
@@ -311,118 +287,253 @@ def extract_image_from_article(article):
             return None
 
         image_url = urljoin(response.url, image_url)
-        parsed = urlparse(image_url)
-
-        if parsed.scheme not in ("http", "https"):
+        if urlparse(image_url).scheme not in ("http", "https"):
             return None
 
-        with requests.get(
-            image_url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=20,
-            stream=True,
-        ) as image_response:
-
-            image_response.raise_for_status()
-
-            content_type = image_response.headers.get(
-                "Content-Type", ""
-            ).lower()
-
+        with session.get(image_url, timeout=20, stream=True) as img_response:
+            img_response.raise_for_status()
+            content_type = img_response.headers.get("Content-Type", "").lower()
             if not content_type.startswith("image/"):
                 return None
 
             data = bytearray()
-            for chunk in image_response.iter_content(64 * 1024):
-                if not chunk:
-                    continue
-                data.extend(chunk)
-
-                if len(data) > MAX_IMAGE_MB * 1024 * 1024:
+            for chunk in img_response.iter_content(65536):
+                if chunk:
+                    data.extend(chunk)
+                if len(data) > MAX_IMAGE_BYTES:
                     return None
 
-        if len(data) < 5000:
+        if len(data) < 4000:
             return None
 
-        try:
-            with Image.open(BytesIO(data)) as img:
-                img.load()
-                if img.width < 320 or img.height < 180:
-                    return None
-                # Convert unusual image formats into standard JPEG.
-                converted = img.convert("RGB")
-                buffer = BytesIO()
-                converted.save(buffer, format="JPEG", quality=92)
-                image_bytes = buffer.getvalue()
-        except Exception:
-            return None
+        with Image.open(BytesIO(data)) as img:
+            img.load()
+            if img.width < 320 or img.height < 180:
+                return None
+            buffer = BytesIO()
+            img.convert("RGB").save(buffer, "JPEG", quality=90)
 
         return {
-            "image_bytes": image_bytes,
-            "image_url": image_url,
+            "bytes": buffer.getvalue(),
+            "url": image_url,
             "article_url": response.url,
-            "title": article["title"],
-            "published": article.get("published", ""),
         }
-
     except Exception:
         return None
 
 
-def find_news_image(query):
-    articles = search_news_links(query, limit=5)
+def find_commons_image(query):
+    """
+    Search Wikimedia Commons for images.
+    Only accept files with a recognizable free-license label.
+    Always retain the original file page for checking attribution.
+    """
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrnamespace": 6,
+        "gsrsearch": query,
+        "gsrlimit": 12,
+        "prop": "imageinfo",
+        "iiprop": "url|mime|size|extmetadata",
+    }
 
+    try:
+        response = session.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+        pages = (response.json().get("query") or {}).get("pages") or {}
+
+        for page in pages.values():
+            infos = page.get("imageinfo") or []
+            if not infos:
+                continue
+
+            info = infos[0]
+            mime = info.get("mime", "")
+            url = info.get("url", "")
+            if not mime.startswith("image/") or not url:
+                continue
+
+            size = info.get("size") or 0
+            if size > MAX_IMAGE_BYTES:
+                continue
+
+            meta = info.get("extmetadata") or {}
+
+            def meta_value(key):
+                return html.unescape(
+                    re.sub(
+                        r"<[^>]+>", "",
+                        (meta.get(key) or {}).get("value", "")
+                    )
+                ).strip()
+
+            license_name = meta_value("LicenseShortName")
+            if not any(term in license_name.lower() for term in (
+                "cc by", "cc0", "public domain", "cc by-sa",
+                "creative commons",
+            )):
+                continue
+
+            with session.get(url, timeout=20, stream=True) as img_response:
+                img_response.raise_for_status()
+                data = bytearray()
+                for chunk in img_response.iter_content(65536):
+                    if chunk:
+                        data.extend(chunk)
+                    if len(data) > MAX_IMAGE_BYTES:
+                        break
+
+            if len(data) > MAX_IMAGE_BYTES or len(data) < 4000:
+                continue
+
+            try:
+                with Image.open(BytesIO(data)) as img:
+                    img.load()
+                    if img.width < 320 or img.height < 180:
+                        continue
+                    buffer = BytesIO()
+                    img.convert("RGB").save(buffer, "JPEG", quality=90)
+            except Exception:
+                continue
+
+            title = page.get("title", "Wikimedia Commons image")
+            file_page = (
+                "https://commons.wikimedia.org/wiki/"
+                + quote_plus(title.replace(" ", "_"))
+            )
+
+            return {
+                "bytes": buffer.getvalue(),
+                "url": url,
+                "article_url": file_page,
+                "title": title,
+                "creator": meta_value("Artist"),
+                "license": license_name,
+                "license_url": meta_value("LicenseUrl"),
+                "provider": "Wikimedia Commons",
+            }
+
+    except Exception:
+        return None
+
+    return None
+
+
+def find_image_and_news(query):
+    articles = []
+    try:
+        articles = search_news(query, limit=6)
+    except Exception:
+        pass
+
+    # First try a relevant image published with a recent news article.
     for article in articles:
-        result = extract_image_from_article(article)
-        if result:
-            result["provider"] = "News article image"
-            result["creator"] = "See original article"
-            result["license"] = "Not verified; permission must be checked"
-            result["source"] = result["article_url"]
-            result["license_url"] = ""
-            result["kind"] = "image"
-            return result, articles
+        found = extract_meta_image(article["url"])
+        if found:
+            return {
+                **found,
+                "title": article["title"],
+                "provider": "News article image",
+                "creator": "See original article",
+                "license": "Unverified; check reuse permission",
+                "license_url": "",
+            }, articles
+
+    # Then try Wikimedia Commons, which exposes source and license metadata.
+    commons = find_commons_image(query)
+    if commons:
+        return commons, articles
 
     return None, articles
 
 
-def download_file(url, destination, max_mb=MAX_VIDEO_MB):
-    total = 0
+# -------------------- IMAGE AND VIDEO RENDERING --------------------
 
-    with requests.get(
-        url,
-        headers={"User-Agent": USER_AGENT},
-        stream=True,
-        timeout=(20, 90),
-    ) as response:
-        response.raise_for_status()
+def draw_wrapped(draw, text, font, max_width, max_lines=3):
+    words = (text or "").split()
+    lines, current = [], ""
 
-        with open(destination, "wb") as output:
-            for chunk in response.iter_content(1024 * 1024):
-                if not chunk:
-                    continue
+    for word in words:
+        candidate = word if not current else current + " " + word
+        box = draw.textbbox((0, 0), candidate, font=font)
+        if box[2] - box[0] <= max_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
 
-                total += len(chunk)
-                if total > max_mb * 1024 * 1024:
-                    raise RuntimeError("Video exceeds the download size limit.")
+    if current:
+        lines.append(current)
 
-                output.write(chunk)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1].rstrip("।, ") + "…"
 
-    if os.path.getsize(destination) < 20000:
-        raise RuntimeError("Downloaded video is too small to use.")
-
-    return destination
+    return lines
 
 
-def render_scene(media_path, overlay_path, output_path, duration, is_image):
-    if is_image:
-        media_args = ["-loop", "1", "-framerate", str(FPS), "-i", media_path]
-    else:
-        media_args = ["-stream_loop", "-1", "-i", media_path]
+def create_overlay(headline, path):
+    image = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
 
-    cmd = [
+    label_font = get_font(40, bold=True)
+    title_font = get_font(66, bold=True)
+    footer_font = get_font(28)
+
+    draw.rounded_rectangle(
+        (65, 55, 500, 145), radius=18, fill=(190, 0, 0, 245)
+    )
+    draw.text(
+        (90, 72), "ताज़ा खबर", font=label_font, fill="white",
+        stroke_width=1, stroke_fill="black"
+    )
+
+    draw.rectangle((0, 790, W, H), fill=(0, 0, 0, 220))
+    draw.rectangle((0, 790, W, 807), fill=(255, 190, 0, 255))
+
+    lines = draw_wrapped(draw, headline, title_font, W - 140, 3)
+    y = 820 if len(lines) < 3 else 808
+
+    for line in lines:
+        draw.text(
+            (70, y), line, font=title_font, fill="white",
+            stroke_width=2, stroke_fill="black"
+        )
+        y += 78
+
+    draw.text(
+        (70, 1030), "समाचार और विश्लेषण",
+        font=footer_font, fill=(255, 215, 80, 255)
+    )
+    image.save(path)
+
+
+def create_fallback(path):
+    image = Image.new("RGB", (W, H), (24, 37, 60))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, W, 25), fill=(205, 0, 0))
+    draw.text(
+        (80, 100), "NEWS EXPLAINER",
+        font=get_font(44, bold=True), fill=(255, 210, 0)
+    )
+    draw.text(
+        (80, 180), "Illustrative background — not actual event footage",
+        font=get_font(30), fill="white"
+    )
+    image.save(path, quality=92)
+
+
+def render_scene(media_path, overlay_path, output_path, duration):
+    args = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-    ] + media_args + [
+        "-loop", "1", "-framerate", str(FPS), "-i", media_path,
         "-loop", "1", "-i", overlay_path,
         "-t", f"{duration:.3f}",
         "-filter_complex",
@@ -430,482 +541,337 @@ def render_scene(media_path, overlay_path, output_path, duration, is_image):
         "crop=1920:1080,fps=25,setsar=1[bg];"
         "[1:v]format=rgba[ov];"
         "[bg][ov]overlay=0:0:shortest=1,format=yuv420p[v]",
-        "-map", "[v]",
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
-        "-r", str(FPS),
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        output_path,
+        "-map", "[v]", "-an",
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-crf", "23", "-r", str(FPS), "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", output_path,
     ]
+    run_cmd(args, timeout=max(180, int(duration * 20)))
 
-    run_cmd(cmd, timeout=max(180, int(duration * 20)))
 
-
-def make_source_report(rows, output_path):
-    with open(output_path, "w", encoding="utf-8") as file:
-        file.write("HINDI NEWS VIDEO — SOURCE REPORT\n")
-        file.write("Verify image permissions before publication.\n\n")
-
-        for index, row in enumerate(rows, 1):
-            file.write(f"Scene {index}: {row.get('headline', '')}\n")
-            file.write(f"Search query: {row.get('query', '')}\n")
+def write_report(rows, path):
+    with open(path, "w", encoding="utf-8") as file:
+        file.write("VIDEO SOURCE REPORT\n")
+        file.write("Check source permissions before publication.\n\n")
+        for i, row in enumerate(rows, 1):
+            file.write(f"Scene {i}: {row.get('headline', '')}\n")
+            file.write(f"Query: {row.get('query', '')}\n")
             file.write(f"Provider: {row.get('provider', '')}\n")
             file.write(f"Source: {row.get('source', '')}\n")
-            file.write(f"Image URL: {row.get('image_url', '')}\n")
+            file.write(f"Image: {row.get('image_url', '')}\n")
+            file.write(f"Creator: {row.get('creator', '')}\n")
             file.write(f"License: {row.get('license', '')}\n")
+            file.write(f"License link: {row.get('license_url', '')}\n")
             file.write(f"Google Images: {row.get('google_images', '')}\n")
-
             for article in row.get("news", []):
-                file.write(
-                    f"Related article: {article['title']} — {article['url']}\n"
-                )
-
+                file.write(f"Article: {article['title']} — {article['url']}\n")
             file.write("\n")
 
 
-if not check_ffmpeg():
+# -------------------- STREAMLIT INTERFACE --------------------
+
+if not ffmpeg_ready():
+    st.error("FFmpeg is missing. Add ffmpeg to packages.txt and redeploy.")
+    st.stop()
+
+FONT_PATH = find_hindi_font()
+if not FONT_PATH:
     st.error(
-        "FFmpeg is missing. Make sure packages.txt contains ffmpeg "
-        "and redeploy the app."
+        "No Devanagari font was found. Your app cannot render Hindi correctly. "
+        "Add fonts-noto-core and fonts-noto-extra to packages.txt, then reboot."
     )
     st.stop()
 
-font_path = find_font()
-if not font_path:
-    st.error(
-        "A Devanagari font was not found. Add fonts-noto-core to "
-        "packages.txt and reboot the Streamlit app."
-    )
-    st.stop()
+st.success(f"Hindi font loaded: {os.path.basename(FONT_PATH)}")
 
 with st.sidebar:
     st.header("Settings")
     model_size = st.selectbox(
-        "Speech transcription model",
-        ["tiny", "base", "small"],
-        index=1,
+        "Hindi speech model", ["tiny", "base", "small"], index=1
     )
     scene_seconds = st.slider(
-        "Scene length (seconds)",
-        min_value=8,
-        max_value=25,
-        value=15,
+        "Average scene length", 8, 25, 15
     )
     max_scenes = st.slider(
-        "Maximum scenes",
-        min_value=5,
-        max_value=60,
-        value=35,
+        "Maximum scenes", 5, 60, 35
     )
 
 audio_file = st.file_uploader(
-    "1. Upload Hindi narration",
+    "1. Upload narration audio",
     type=["mp3", "wav", "m4a", "aac", "ogg", "flac"],
 )
-
-transcript_upload = st.file_uploader(
-    "Optional: upload Hindi transcript (.txt)",
-    type=["txt"],
+transcript_file = st.file_uploader(
+    "Optional: upload a Hindi transcript (.txt)", type=["txt"]
 )
+
+if "transcript_text" not in st.session_state:
+    st.session_state.transcript_text = ""
+if "scene_plan" not in st.session_state:
+    st.session_state.scene_plan = ""
 
 if audio_file:
     st.audio(audio_file)
 
-if "transcript_text" not in st.session_state:
-    st.session_state.transcript_text = ""
-
-if "scene_plan" not in st.session_state:
-    st.session_state.scene_plan = ""
-
-col1, col2 = st.columns(2)
-
-with col1:
+left, right = st.columns(2)
+with left:
     transcribe_clicked = st.button(
-        "2. Transcribe audio",
-        type="primary",
-        disabled=audio_file is None,
+        "2. Transcribe in Hindi",
+        type="primary", disabled=audio_file is None
     )
-
-with col2:
-    clear_clicked = st.button("Clear transcript")
-
-if clear_clicked:
-    st.session_state.transcript_text = ""
-    st.session_state.scene_plan = ""
-    st.rerun()
+with right:
+    if st.button("Clear transcript and scenes"):
+        st.session_state.transcript_text = ""
+        st.session_state.scene_plan = ""
+        st.rerun()
 
 if transcribe_clicked:
-    with st.spinner("Transcribing audio in Hindi..."):
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                audio_path = os.path.join(temp_dir, "narration_audio")
-                with open(audio_path, "wb") as file:
+    try:
+        with st.spinner("Transcribing audio with Hindi forced..."):
+            with tempfile.TemporaryDirectory() as td:
+                path = os.path.join(td, "narration")
+                with open(path, "wb") as file:
                     file.write(audio_file.getbuffer())
+                rows, language = transcribe_audio(path, model_size)
 
-                rows, detected_language = transcribe_audio(
-                    audio_path, model_size
-                )
+        st.session_state.transcript_text = "\n".join(
+            row["text"] for row in rows
+        )
+        st.success(
+            f"Transcription finished. Model language setting: Hindi. "
+            f"Reported language: {language}."
+        )
+        st.info(
+            "Please review names and spelling. Forcing Hindi improves "
+            "Devanagari output but cannot guarantee every word is correct."
+        )
+    except Exception as error:
+        st.error(f"Transcription failed: {error}")
 
-            st.session_state.transcript_text = "\n".join(
-                row["text"] for row in rows
-            )
-            st.success(
-                f"Transcription complete. Language: {detected_language}"
-            )
-
-        except Exception as error:
-            st.error(f"Transcription failed: {error}")
-            st.info("You can upload a transcript as a .txt file instead.")
-
-if transcript_upload is not None:
-    st.session_state.transcript_text = transcript_upload.getvalue().decode(
+if transcript_file:
+    st.session_state.transcript_text = transcript_file.getvalue().decode(
         "utf-8", errors="replace"
     )
 
-transcript_text = st.text_area(
-    "3. Review and edit the Hindi transcript",
+transcript = st.text_area(
+    "3. Review or correct your Hindi transcript",
     value=st.session_state.transcript_text,
     height=200,
-    placeholder="Your Hindi narration transcript appears here.",
 )
-st.session_state.transcript_text = transcript_text
-
-
-def suggest_query(text):
-    hints = [
-        (r"मोदी|प्रधानमंत्री|पीएम", "Narendra Modi Indian government latest news"),
-        (r"अमित शाह|गृह मंत्री", "Amit Shah Indian home minister latest news"),
-        (r"राहुल गांधी|कांग्रेस", "Rahul Gandhi Congress latest news India"),
-        (r"भाजपा|बीजेपी|BJP", "BJP Indian politics latest news"),
-        (r"सुप्रीम कोर्ट|अदालत|कोर्ट|जज", "Supreme Court of India latest news"),
-        (r"चुनाव|वोटर|मतदान|चुनाव आयोग", "India election commission voting news"),
-        (r"संसद|लोकसभा|राज्यसभा", "Indian parliament latest news"),
-        (r"पुलिस|गिरफ्तार|लाठीचार्ज", "Indian police arrest protest latest news"),
-        (r"प्रदर्शन|धरना|आंदोलन|रैली", "India protest rally latest news"),
-        (r"बंगाल|ममता", "West Bengal Mamata Banerjee latest news"),
-        (r"युद्ध|सेना|मिसाइल|सीमा", "international conflict military latest news"),
-        (r"ट्रंप|अमेरिका|अमेरिकी", "Donald Trump White House latest news"),
-        (r"चीन|चीनी", "China government latest news"),
-        (r"किसान", "Indian farmers protest latest news"),
-        (r"मौसम|बारिश|बाढ़", "India weather rain flood latest news"),
-        (r"एआई|कृत्रिम बुद्धिमत्ता|तकनीक", "AI technology latest news"),
-    ]
-
-    for pattern, query in hints:
-        if re.search(pattern, text or "", re.I):
-            return query
-
-    english = re.findall(r"[A-Za-z][A-Za-z -]{2,}", text or "")
-    useful = [
-        item.strip()
-        for item in english
-        if item.strip().lower() not in {
-            "the", "and", "for", "with", "from", "this", "that", "news"
-        }
-    ]
-
-    if useful:
-        return " ".join(useful[:5]) + " India latest news"
-
-    return "India government latest news"
-
-
-def make_headline(text, limit=85):
-    text = re.sub(r"\s+", " ", text or "").strip()
-
-    if len(text) <= limit:
-        return text or "ताज़ा खबर"
-
-    shortened = text[:limit]
-    if " " in shortened:
-        shortened = shortened.rsplit(" ", 1)[0]
-
-    return shortened.rstrip(" ,।-") + "…"
-
+st.session_state.transcript_text = transcript
 
 if st.button(
     "4. Create scene plan",
     type="primary",
-    disabled=not (audio_file and transcript_text.strip()),
+    disabled=not (audio_file and transcript.strip()),
 ):
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            audio_path = os.path.join(temp_dir, "narration_audio")
-            with open(audio_path, "wb") as file:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "narration")
+            with open(path, "wb") as file:
                 file.write(audio_file.getbuffer())
-            duration = audio_duration(audio_path)
+            duration = audio_length(path)
 
-        sentences = [
-            item.strip()
-            for item in re.split(r"(?<=[।!?])\s+|\n+", transcript_text)
-            if item.strip()
-        ]
-
-        count = max(
-            1,
-            min(max_scenes, int(duration // scene_seconds) + 1),
+        st.session_state.scene_plan = make_scene_plan(
+            transcript, duration, max_scenes, scene_seconds
         )
-        count = min(count, max(1, len(sentences)))
-
-        chunk_size = max(1, (len(sentences) + count - 1) // count)
-        groups = [
-            " ".join(sentences[i:i + chunk_size])
-            for i in range(0, len(sentences), chunk_size)
-        ]
-
-        lines = []
-        for group in groups:
-            lines.append(
-                f"{suggest_query(group)} | {make_headline(group)}"
-            )
-
-        st.session_state.scene_plan = "\n".join(lines)
-        st.success(f"Created {len(lines)} scene suggestions.")
-
+        st.success("Scene plan created. Review the search keywords.")
     except Exception as error:
-        st.error(f"Could not create the scene plan: {error}")
+        st.error(f"Could not create scene plan: {error}")
 
 scene_plan = st.text_area(
-    "5. Edit scenes — one per line: English search keywords | Hindi headline",
+    "5. Edit scenes: English search query | Hindi headline",
     value=st.session_state.scene_plan,
     height=300,
     placeholder=(
-        "Indian parliament latest news | संसद में बड़ी हलचल\n"
-        "Supreme Court of India latest news | सुप्रीम कोर्ट का बड़ा फैसला"
+        "Supreme Court of India latest news | सुप्रीम कोर्ट का बड़ा फैसला\n"
+        "Rahul Gandhi Congress latest news | राहुल गांधी का बड़ा बयान"
     ),
 )
 st.session_state.scene_plan = scene_plan
 
 st.caption(
-    "The app first searches related news articles and attempts to retrieve "
-    "their main images. If that fails, it creates a labelled graphic. "
-    "Review every source and its reuse permission before publishing."
+    "News article images are tried first, followed by Wikimedia Commons. "
+    "When no image can be retrieved, a labelled graphic is used. "
+    "Google Images links are provided for manual searching."
 )
 
-generate = st.button(
+if st.button(
     "6. Generate 1080p MP4",
     type="primary",
     disabled=not (audio_file and scene_plan.strip()),
-)
-
-if generate:
-    parsed = []
-
+):
+    scenes = []
     for line in scene_plan.splitlines():
-        line = line.strip()
-        if not line:
+        if not line.strip():
             continue
-
         parts = line.split("|", 1)
         query = parts[0].strip()
-        headline = (
-            parts[1].strip()
-            if len(parts) > 1
-            else make_headline(query)
-        )
-
+        headline = parts[1].strip() if len(parts) > 1 else make_headline(query)
         if query:
-            parsed.append({
-                "query": query,
-                "headline": headline,
-            })
+            scenes.append({"query": query, "headline": headline})
 
-    if not parsed:
-        st.error("Add at least one scene.")
+    if not scenes:
+        st.error("No scenes found.")
         st.stop()
 
     progress = st.progress(0)
     status = st.empty()
-    sources = []
+    source_rows = []
 
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            audio_path = os.path.join(temp_dir, "narration_audio")
+        with tempfile.TemporaryDirectory() as td:
+            audio_path = os.path.join(td, "narration")
             with open(audio_path, "wb") as file:
                 file.write(audio_file.getbuffer())
 
-            total_duration = audio_duration(audio_path)
-            scene_duration = total_duration / len(parsed)
-
+            duration = audio_length(audio_path)
+            each_duration = duration / len(scenes)
             scene_files = []
 
-            for index, item in enumerate(parsed):
+            for i, scene in enumerate(scenes):
                 status.info(
-                    f"Scene {index + 1}/{len(parsed)}: "
-                    f"searching {item['query']}"
+                    f"Scene {i + 1}/{len(scenes)}: searching news images..."
                 )
 
-                image_result, articles = None, []
+                found = None
+                articles = []
                 try:
-                    image_result, articles = find_news_image(item["query"])
+                    found, articles = find_image_and_news(scene["query"])
                 except Exception as error:
-                    st.warning(
-                        f"News search failed for scene {index + 1}: {error}"
-                    )
+                    st.warning(f"Search failed for scene {i + 1}: {error}")
 
-                google_images_url = (
+                google_url = (
                     "https://www.google.com/search?tbm=isch&q="
-                    + quote_plus(item["query"])
+                    + quote_plus(scene["query"])
                 )
 
-                if image_result:
-                    media_path = os.path.join(
-                        temp_dir, f"image_{index:03d}.jpg"
-                    )
+                if found:
+                    media_path = os.path.join(td, f"image_{i:03d}.jpg")
                     with open(media_path, "wb") as file:
-                        file.write(image_result["image_bytes"])
+                        file.write(found["bytes"])
 
-                    is_image = True
                     source_row = {
-                        **item,
-                        **image_result,
+                        **scene,
+                        "provider": found.get("provider", "Image"),
+                        "title": found.get("title", ""),
+                        "source": found.get("article_url", ""),
+                        "image_url": found.get("url", ""),
+                        "creator": found.get("creator", "Check source"),
+                        "license": found.get("license", "Unverified"),
+                        "license_url": found.get("license_url", ""),
                         "news": articles,
-                        "google_images": google_images_url,
+                        "google_images": google_url,
                     }
-
                 else:
-                    media_path = os.path.join(
-                        temp_dir, f"fallback_{index:03d}.jpg"
-                    )
-                    make_fallback_card(media_path, font_path)
-                    is_image = True
-
+                    media_path = os.path.join(td, f"fallback_{i:03d}.jpg")
+                    create_fallback(media_path)
                     source_row = {
-                        **item,
-                        "provider": "Generated fallback graphic",
-                        "title": "Illustrative background",
-                        "creator": "Generated by this app",
-                        "license": "Original graphic",
+                        **scene,
+                        "provider": "Fallback graphic — no image retrieved",
+                        "title": "Illustrative graphic",
                         "source": "",
                         "image_url": "",
+                        "creator": "Generated by this app",
+                        "license": "Original graphic",
+                        "license_url": "",
                         "news": articles,
-                        "google_images": google_images_url,
+                        "google_images": google_url,
                     }
 
-                overlay_path = os.path.join(
-                    temp_dir, f"overlay_{index:03d}.png"
-                )
-                make_overlay(item["headline"], overlay_path, font_path)
+                overlay_path = os.path.join(td, f"overlay_{i:03d}.png")
+                create_overlay(scene["headline"], overlay_path)
 
-                scene_path = os.path.join(
-                    temp_dir, f"scene_{index:03d}.mp4"
-                )
+                output_scene = os.path.join(td, f"scene_{i:03d}.mp4")
                 render_scene(
-                    media_path,
-                    overlay_path,
-                    scene_path,
-                    scene_duration,
-                    is_image,
+                    media_path, overlay_path, output_scene, each_duration
                 )
 
-                scene_files.append(scene_path)
-                sources.append(source_row)
-                progress.progress((index + 1) / (len(parsed) + 1))
+                scene_files.append(output_scene)
+                source_rows.append(source_row)
+                progress.progress((i + 1) / (len(scenes) + 1))
 
-            concat_file = os.path.join(temp_dir, "concat.txt")
-            with open(concat_file, "w", encoding="utf-8") as file:
+            concat_path = os.path.join(td, "concat.txt")
+            with open(concat_path, "w", encoding="utf-8") as file:
                 for path in scene_files:
-                    safe_path = path.replace("'", "'\\''")
-                    file.write(f"file '{safe_path}'\n")
+                    file.write("file '" + path.replace("'", "'\\''") + "'\n")
 
-            silent_video = os.path.join(temp_dir, "silent_video.mp4")
-
+            silent_path = os.path.join(td, "silent.mp4")
             run_cmd([
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "concat", "-safe", "0", "-i", concat_file,
-                "-c", "copy", "-movflags", "+faststart", silent_video,
+                "-f", "concat", "-safe", "0", "-i", concat_path,
+                "-c", "copy", "-movflags", "+faststart", silent_path,
             ], timeout=900)
 
-            output_path = os.path.join(
-                temp_dir, "hindi_news_1080p.mp4"
-            )
-
-            status.info("Adding narration and exporting final video...")
-
+            final_path = os.path.join(td, "hindi_news_1080p.mp4")
+            status.info("Combining scenes with narration...")
             run_cmd([
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", silent_video,
-                "-i", audio_path,
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-t", f"{total_duration:.3f}",
-                "-movflags", "+faststart",
-                output_path,
+                "-i", silent_path, "-i", audio_path,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-t", f"{duration:.3f}", "-movflags", "+faststart",
+                final_path,
             ], timeout=900)
 
-            report_path = os.path.join(temp_dir, "source_report.txt")
-            make_source_report(sources, report_path)
+            report_path = os.path.join(td, "source_report.txt")
+            write_report(source_rows, report_path)
 
-            with open(output_path, "rb") as file:
+            with open(final_path, "rb") as file:
                 video_bytes = file.read()
-
             with open(report_path, "rb") as file:
                 report_bytes = file.read()
 
             progress.progress(1.0)
-            status.success("Video generated successfully.")
-
+            status.success("Video export finished.")
             st.video(video_bytes)
-
             st.download_button(
                 "Download 1080p MP4",
-                data=video_bytes,
+                video_bytes,
                 file_name="hindi_news_1080p.mp4",
                 mime="video/mp4",
             )
-
             st.download_button(
                 "Download source report",
-                data=report_bytes,
+                report_bytes,
                 file_name="source_report.txt",
                 mime="text/plain",
             )
 
-            st.subheader("Scene sources")
-
-            for index, row in enumerate(sources, 1):
+            st.subheader("Scene image results")
+            for i, row in enumerate(source_rows, 1):
                 with st.expander(
-                    f"Scene {index}: {row.get('headline', '')}"
+                    f"Scene {i}: {row.get('headline', '')}"
                 ):
-                    st.write("Search query:", row.get("query", ""))
-                    st.write("Media source:", row.get("provider", ""))
+                    st.write("Search:", row.get("query", ""))
+                    st.write("Result:", row.get("provider", ""))
                     st.write("License:", row.get("license", ""))
 
                     if row.get("source"):
                         st.markdown(
-                            f"[Open original article]({row['source']})"
+                            f"[Open original source]({row['source']})"
                         )
-
                     if row.get("image_url"):
                         st.markdown(
-                            f"[Open original image]({row['image_url']})"
+                            f"[Open image]({row['image_url']})"
                         )
-
                     st.markdown(
                         f"[Search Google Images]({row['google_images']})"
                     )
 
-                    if row.get("news"):
-                        st.write("Related news articles:")
-                        for article in row["news"]:
-                            st.markdown(
-                                f"- [{article['title']}]({article['url']})"
-                            )
+                    for article in row.get("news", []):
+                        st.markdown(
+                            f"- [{article['title']}]({article['url']})"
+                        )
 
             st.warning(
-                "Some scenes may use fallback graphics. Check the scene "
-                "sources and image reuse permissions before uploading."
+                "Review every image's permission before publication. "
+                "Some scenes may still use fallback graphics if sources "
+                "block image retrieval."
             )
 
     except Exception as error:
         st.error(f"Video generation failed: {error}")
         st.info(
-            "Try a short 30–60 second audio file first. Free hosting can "
-            "run out of memory or time when rendering long videos."
+            "Test a short narration first. Free hosting may have limited "
+            "memory and processing time."
         )
